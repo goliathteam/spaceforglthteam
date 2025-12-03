@@ -1,0 +1,952 @@
+import pandas as pd
+import utilsgi as utils
+
+# =============================
+# Conexión a Datastream (entorno bancario)
+# =============================
+ds = utils.datastream.DataStream().get_datastream_connection()
+
+# Resto de imports (se colocan tras el bloque estándar por política interna)
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import PercentFormatter
+import seaborn as sns
+import time
+from typing import Dict, Tuple
+import math
+from dataclasses import dataclass
+
+# Estilo gráfico
+sns.set_theme(style="whitegrid")
+pd.plotting.register_matplotlib_converters()
+pd.options.mode.use_inf_as_na = True
+
+# =============================
+# Parámetros configurables de entrada
+# =============================
+# Por defecto: ticker S&P 500 (S&PCOMP), desde 01/01/2010 hasta hoy (excluyendo el día en curso por defecto)
+TICKER: str = 'S&PCOMP'
+START_DATE: str = '01/01/2010'   # Acepta 'DD/MM/YYYY', 'YYYY-MM-DD' o 'YYYYMMDD'
+END_DATE: str = 'today'          # 'today' usa la fecha actual en zona Europe/Madrid
+EXCLUDE_TODAY: bool = True       # Por defecto excluye el día en curso para evitar datos incompletos
+
+# Umbrales
+INTRADAY_RANGE_THRESHOLD: float = 3.5   # %
+DRAWDOWN_THRESHOLD: float = 0.05        # 5%
+
+# Ventanas y opciones
+ROLLING_RET_WINDOWS: Dict[str, int] = {'1M': 21, '3M': 63, '6M': 126, '1Y': 252, '3Y': 756}
+ROLLING_VOL_WINDOW: int = 21  # días hábiles para volatilidad diaria
+
+# =============================
+# Utilidades
+# =============================
+def _to_yyyymmdd(date_like: str) -> str:
+    """Convierte 'today' o string de fecha común en 'YYYYMMDD'. Zona horaria: Europe/Madrid."""
+    if isinstance(date_like, str) and date_like.lower() in {'today', 'hoy'}:
+        dt = pd.Timestamp.now(tz='Europe/Madrid').date()
+        return dt.strftime('%Y%m%d')
+    # Intentos de parseo flexibles
+    for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%Y%m%d'):
+        try:
+            return pd.to_datetime(date_like, format=fmt).strftime('%Y%m%d')
+        except Exception:
+            continue
+    # Último recurso: parseo genérico de pandas
+    return pd.to_datetime(date_like).strftime('%Y%m%d')
+
+
+def _yesterday_yyyymmdd() -> str:
+    return (pd.Timestamp.now(tz='Europe/Madrid').date() - pd.Timedelta(days=1)).strftime('%Y%m%d')
+
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplana columnas si vienen como MultiIndex. Prefiere nivel 'Field'."""
+    if isinstance(df.columns, pd.MultiIndex):
+        names = df.columns.names or []
+        if 'Field' in names:
+            df.columns = df.columns.get_level_values(names.index('Field'))
+        else:
+            df.columns = [str(col[-1]) if isinstance(col, tuple) else str(col) for col in df.columns]
+    else:
+        df.columns = [str(c) for c in df.columns]
+    return df
+
+
+def safe_get_data(ticker: str, **kwargs) -> pd.DataFrame:
+    """Pequeño helper con reintentos para llamadas a Datastream."""
+    for attempt in range(3):
+        try:
+            return ds.get_data(tickers=ticker, **kwargs)
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(1 + attempt)
+
+
+def _choose_close(df: pd.DataFrame) -> str:
+    """Elige la columna de cierre: usa 'PI' si existe (recomendado para índices), si no 'P'."""
+    if 'PI' in df.columns and not df['PI'].isna().all():
+        return 'PI'
+    if 'P' in df.columns and not df['P'].isna().all():
+        return 'P'
+    raise KeyError("No se encontró columna de cierre ('PI' o 'P'). Ajusta fields o ticker.")
+
+
+def get_ohlc(ticker: str, start: str, end: str) -> pd.DataFrame:
+    fields = ['PO', 'PH', 'PL', 'PI', 'P']  # Open, High, Low, CloseIndex, Close
+    raw = safe_get_data(ticker, fields=fields, start=start, end=end, freq='D')
+    if raw is None or raw.empty:
+        raise ValueError(f"Descarga vacía para {ticker}. Revisa ticker/campos/fechas.")
+    df = _flatten_columns(raw).copy()
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    # Validaciones mínimas
+    if not {'PO', 'PH', 'PL'}.issubset(df.columns):
+        faltan = {'PO', 'PH', 'PL'} - set(df.columns)
+        raise KeyError(f"Faltan columnas OHLC: {faltan}")
+    close_col = _choose_close(df)
+    df = df.rename(columns={'PO': 'Open', 'PH': 'High', 'PL': 'Low', close_col: 'Close'})
+    # Mantener solo columnas finales
+    return df[['Open', 'High', 'Low', 'Close']].dropna(how='any')
+
+
+def compute_drawdown(close: pd.Series) -> Tuple[pd.Series, float, Tuple[pd.Timestamp, pd.Timestamp]]:
+    roll_max = close.cummax()
+    dd = close / roll_max - 1.0
+    dd_min_date = dd.idxmin()
+    peak_date = close.loc[:dd_min_date].idxmax()
+    max_dd = float(dd.min())
+    return dd, max_dd, (peak_date, dd_min_date)
+
+
+def annual_returns(close: pd.Series) -> Tuple[pd.Series, float]:
+    y_last = close.resample('Y').last()
+    y_ret = y_last.pct_change().dropna()
+    # Último año completo: todos los años estrictamente anteriores al año de la última fecha
+    last_date = close.index.max()
+    full_years = y_ret[y_ret.index.year < last_date.year]
+    # YTD actual
+    prev_year_end = y_last.loc[:str(last_date.year - 1)].iloc[-1] if (y_last.index.year < last_date.year).any() else np.nan
+    ytd = float(close.iloc[-1] / prev_year_end - 1.0) if pd.notna(prev_year_end) else np.nan
+    return full_years, ytd
+
+
+def monthly_returns_current_year(close: pd.Series) -> Tuple[pd.Series, float]:
+    last_date = close.index.max()
+    curr_year = last_date.year
+    m_last = close.loc[str(curr_year)].resample('M').last()
+    m_ret = m_last.pct_change().dropna()
+    # MTD: desde fin de mes previo hasta fecha actual
+    prev_month_end = close.loc[:last_date.replace(day=1) - pd.Timedelta(days=1)].iloc[-1] if len(close) > 1 else np.nan
+    mtd = float(close.iloc[-1] / prev_month_end - 1.0) if pd.notna(prev_month_end) else np.nan
+    return m_ret, mtd
+
+
+def rolling_returns(close: pd.Series, windows: Dict[str, int]) -> pd.DataFrame:
+    out = {}
+    for name, days in windows.items():
+        if days < 1:
+            continue
+        out[name] = close / close.shift(days) - 1.0
+    return pd.DataFrame(out)
+
+
+def compute_mode_continuous(s: pd.Series) -> float:
+    """
+    Estimación de la moda para series continuas mediante el bin con mayor frecuencia.
+    Devuelve el centro del bin o np.nan si la serie está vacía.
+    """
+    arr = s.dropna().to_numpy()
+    if arr.size == 0:
+        return np.nan
+    counts, bin_edges = np.histogram(arr, bins='auto')
+    idx = counts.argmax()
+    mode_val = (bin_edges[idx] + bin_edges[idx + 1]) / 2.0
+    return float(mode_val)
+
+
+def count_drawdown_events_by_year(close: pd.Series, threshold: float) -> pd.Series:
+    dd, _, _ = compute_drawdown(close)
+    df = pd.DataFrame({'Drawdown': dd})
+    df['Year'] = df.index.year
+    in_dd = False
+    events = []
+    for idx, val in df['Drawdown'].items():
+        if (not in_dd) and (val < -threshold):
+            in_dd = True
+            events.append(idx)
+        elif in_dd and np.isclose(val, 0.0, atol=1e-12):
+            in_dd = False
+    years = pd.to_datetime(events).year if len(events) else []
+    if len(df) == 0:
+        return pd.Series(dtype=float)
+    years_range = np.arange(df['Year'].min(), df['Year'].max() + 1)
+    counts = pd.Series(years).value_counts().reindex(years_range, fill_value=0).sort_index()
+    counts.index = counts.index.astype(int)
+    return counts
+
+
+@dataclass
+class TUWEvent:
+    start: pd.Timestamp
+    end: pd.Timestamp | None
+    tuw_days: int
+    min_dd: float
+    min_date: pd.Timestamp
+
+
+def compute_time_under_water_events(close: pd.Series, threshold: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Devuelve dos DataFrames con episodios de DD: recuperados y en curso (censurados).
+    - tuw_days: duración en días hábiles entre inicio y recuperación
+    - min_dd: drawdown mínimo del episodio
+    """
+    dd = close / close.cummax() - 1.0
+    events_rec, events_cens = [], []
+    in_dd = False
+    start = None
+    curr_min = 0.0
+    curr_min_date = None
+
+    for date, val in dd.items():
+        if (not in_dd) and (val < -threshold):
+            in_dd = True
+            start = date
+            curr_min = val
+            curr_min_date = date
+        if in_dd:
+            if val < curr_min:
+                curr_min = val
+                curr_min_date = date
+            if np.isclose(val, 0.0, atol=1e-12):  # recuperación
+                end = date
+                tuw_days = dd.loc[start:end].shape[0]  # nº de observaciones (días hábiles) bajo el agua
+                events_rec.append(TUWEvent(start, end, int(tuw_days), float(curr_min), curr_min_date))
+                in_dd = False
+                start = None
+
+    # Censurado (no recuperado al final de la muestra)
+    if in_dd and start is not None:
+        end = None
+        tuw_days = dd.loc[start:].shape[0]
+        events_cens.append(TUWEvent(start, end, int(tuw_days), float(curr_min), curr_min_date))
+
+    def _to_df(events: list[TUWEvent]) -> pd.DataFrame:
+        if not events:
+            return pd.DataFrame(columns=['start', 'end', 'tuw_days', 'min_dd', 'min_date'])
+        return pd.DataFrame([e.__dict__ for e in events])
+
+    return _to_df(events_rec), _to_df(events_cens)
+
+# =============================
+# Descarga y preparación de datos
+# =============================
+START = _to_yyyymmdd(START_DATE)
+user_end = _to_yyyymmdd(END_DATE)
+END = _yesterday_yyyymmdd() if EXCLUDE_TODAY else user_end
+# Asegurar que END no supere el fin solicitado
+if pd.to_datetime(END) > pd.to_datetime(user_end):
+    END = user_end
+
+ohlc = get_ohlc(TICKER, start=START, end=END)
+close = ohlc['Close']
+
+# Comprobaciones mínimas
+if ohlc.empty or close.empty:
+    raise ValueError("La serie descargada está vacía tras limpieza.")
+
+# =============================
+# 1) Gráfico OHLC con medias móviles 50 & 200
+# =============================
+fig1, ax1 = plt.subplots(figsize=(12, 6))
+try:
+    import mplfinance as mpf
+    mpf_df = ohlc.copy()
+    mpf_df.index.name = 'Date'
+    mpf.plot(mpf_df, type='candle', mav=(50, 200), volume=False, style='yahoo',
+             title=f"{TICKER} – OHLC con SMA 50/200")
+except Exception:
+    # Fallback robusto: vela simplificada sin mplfinance (usa el índice de ohlc como eje X)
+    x = mdates.date2num(ohlc.index.to_pydatetime())
+    ax1.vlines(x, ohlc['Low'].values, ohlc['High'].values, color='gray', linewidth=0.8)
+    ax1.scatter(x, ohlc['Open'].values, s=6, color='black', marker='_', label='Open')
+    ax1.scatter(x, ohlc['Close'].values, s=6, color='blue', marker='_', label='Close')
+    ax1.plot(ohlc.index, close.rolling(50).mean(), label='SMA 50', color='#1f77b4', linewidth=1.2)
+    ax1.plot(ohlc.index, close.rolling(200).mean(), label='SMA 200', color='#ff7f0e', linewidth=1.2)
+    ax1.set_title(f"{TICKER} – OHLC (fallback) con SMA 50/200")
+    ax1.set_xlabel('Fecha')
+    ax1.set_ylabel('Precio')
+    locator = mdates.AutoDateLocator()
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax1.xaxis.set_major_locator(locator)
+    ax1.xaxis.set_major_formatter(formatter)
+    ax1.legend(loc='upper left')
+    plt.tight_layout()
+
+# =============================
+# 2) Gráfico de drawdown
+# =============================
+dd, max_dd, (peak_dt, trough_dt) = compute_drawdown(close)
+fig2, ax2 = plt.subplots(figsize=(12, 4))
+ax2.fill_between(dd.index, dd.values, 0, color='salmon', alpha=0.5)
+ax2.plot(dd.index, dd.values, color='firebrick', linewidth=1)
+ax2.axhline(0, color='black', linewidth=0.8)
+ax2.scatter([peak_dt, trough_dt], [0, dd.loc[trough_dt]], color='red', zorder=3)
+ax2.annotate(f"Max DD: {max_dd:.2%}\n({peak_dt.date()} → {trough_dt.date()})",
+             xy=(trough_dt, dd.loc[trough_dt]), xytext=(10, 10), textcoords='offset points',
+             bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='red', alpha=0.8), color='red')
+ax2.set_title(f"{TICKER} – Drawdown (pérdida acumulada desde máximo)")
+ax2.set_ylabel('Drawdown')
+ax2.yaxis.set_major_formatter(PercentFormatter(1))
+locator = mdates.AutoDateLocator(); formatter = mdates.ConciseDateFormatter(locator)
+ax2.xaxis.set_major_locator(locator); ax2.xaxis.set_major_formatter(formatter)
+plt.tight_layout()
+
+# =============================
+# 3) Barras – Rentabilidades anuales + YTD (en el mismo gráfico)
+# =============================
+y_ret_full, ytd = annual_returns(close)
+fig3, ax3 = plt.subplots(figsize=(12, 4))
+
+# Años completos
+y_ret_full.index = y_ret_full.index.year
+labels = [str(int(y)) for y in y_ret_full.index]
+values = list((y_ret_full.values * 100).astype(float))
+
+# Añadir YTD del año en curso como una barra más
+curr_year = int(close.index.max().year)
+if not np.isnan(ytd):
+    labels.append(f"{curr_year} YTD")
+    values.append(float(ytd * 100))
+
+ax3.bar(labels, values, color='steelblue')
+ax3.axhline(0, color='black', linewidth=0.8)
+ax3.set_title('Rentabilidades anuales (incluye barra YTD)')
+ax3.set_xlabel('Año')
+ax3.set_ylabel('%')
+ax3.yaxis.set_major_formatter(PercentFormatter(100))
+# Mejoras de legibilidad
+ax3.tick_params(axis='x', rotation=45)
+# Rango Y uniforme con margen
+if values:
+    ymin, ymax = min(values + [0]), max(values + [0])
+    pad = max(5, 0.05 * (ymax - ymin if ymax != ymin else 100))
+    ax3.set_ylim(ymin - pad, ymax + pad)
+plt.tight_layout()
+
+# =============================
+# 4) Barras – Rentabilidades mensuales + MTD (sin duplicar el mes en curso)
+# =============================
+m_ret_all, mtd = monthly_returns_current_year(close)
+fig4, ax4 = plt.subplots(figsize=(12, 4))
+
+last_date = close.index.max()
+curr_year = last_date.year
+curr_month = last_date.month
+
+# Meses completos: todos los meses < mes actual
+mask_full_months = m_ret_all.index.month < curr_month
+m_ret_full_months = m_ret_all[mask_full_months]
+
+# Etiquetas y valores
+labels = list(m_ret_full_months.index.strftime('%b'))
+values = list((m_ret_full_months.values * 100).astype(float))
+
+# Añadir MTD al final (sustituyendo al mes en curso)
+if not np.isnan(mtd):
+    labels.append('MTD')
+    values.append(float(mtd * 100))
+
+ax4.bar(labels, values, color='teal', alpha=0.85)
+ax4.axhline(0, color='black', linewidth=0.8)
+ax4.set_title(f"Rentabilidades mensuales – año {curr_year} (mes en curso como MTD)")
+ax4.set_ylabel('%')
+ax4.yaxis.set_major_formatter(PercentFormatter(100))
+ax4.tick_params(axis='x', rotation=0)
+plt.tight_layout()
+
+# =============================
+# 5) Línea – Rentabilidades rolling (1M, 3M, 6M, 1Y, 3Y)
+# 6) Histogramas – Distribución de rentabilidades rolling (una sola fila)
+# =============================
+roll_ret_df = rolling_returns(close, ROLLING_RET_WINDOWS)
+
+# Figura con 2 filas: (1) línea a todo ancho, (2) histogramas en una sola fila
+n_hist = len(ROLLING_RET_WINDOWS)
+fig5 = plt.figure(figsize=(4 + 3*n_hist, 7))
+gs = fig5.add_gridspec(2, n_hist, height_ratios=[2, 1], wspace=0.25, hspace=0.35)
+
+# Línea completa (fila 0, todas las columnas)
+ax5_lines = fig5.add_subplot(gs[0, :])
+colors = sns.color_palette('tab10', n_colors=n_hist)
+for (name, _), c in zip(ROLLING_RET_WINDOWS.items(), colors):
+    ax5_lines.plot(roll_ret_df.index, roll_ret_df[name], label=name, linewidth=1.2, color=c)
+ax5_lines.axhline(0, color='black', linewidth=0.9)
+ax5_lines.set_title('Rentabilidades rolling')
+ax5_lines.yaxis.set_major_formatter(PercentFormatter(1))
+locator = mdates.AutoDateLocator(); formatter = mdates.ConciseDateFormatter(locator)
+ax5_lines.xaxis.set_major_locator(locator); ax5_lines.xaxis.set_major_formatter(formatter)
+ax5_lines.legend(loc='upper left', ncol=3, fontsize=9)
+
+# Histogramas (fila 1, una columna por ventana)
+for i, name in enumerate(ROLLING_RET_WINDOWS.keys()):
+    ax = fig5.add_subplot(gs[1, i])
+    data = roll_ret_df[name].dropna()
+
+    sns.histplot(data, bins='auto', kde=False, color=colors[i], ax=ax)
+
+    # Línea 0%
+    ax.axvline(0.0, color='black', linestyle='-', linewidth=1.0)
+
+    # Moda: texto arriba a la derecha (1 decimal + %)
+    mode_val = compute_mode_continuous(data)
+    if not np.isnan(mode_val):
+        ax.text(
+            0.98, 0.95,
+            f"Moda: {mode_val*100:.1f}%",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            color="black"
+        )
+
+    # Valor actual: línea roja + texto junto a la línea (1 decimal + %)
+    if len(data):
+        curr_val = float(data.iloc[-1])
+        ax.axvline(curr_val, color='red', linestyle='--', linewidth=1.2)
+
+        ymax = ax.get_ylim()[1]
+        ax.text(
+            curr_val,
+            ymax * 0.9,
+            f"{curr_val*100:.1f}%",
+            color="red",
+            ha="center",
+            va="top",
+            fontsize=8
+        )
+
+    ax.set_title(f"Hist. {name}")
+    ax.xaxis.set_major_formatter(PercentFormatter(1))
+    ax.set_ylabel('Frecuencia')
+
+plt.suptitle('Rolling returns – línea completa + histogramas (1 fila)', y=0.98)
+plt.tight_layout(rect=[0.03, 0.03, 0.98, 0.95])
+
+# =============================
+# 7) Gráficos de barras apiladas – frecuencia mensual de días con rentabilidad rolling ≥ moda
+# =============================
+# Calcular modas por ventana (se reutiliza compute_mode_continuous)
+modes: Dict[str, float] = {}
+for col in roll_ret_df.columns:
+    mode_val = compute_mode_continuous(roll_ret_df[col])
+    modes[col] = mode_val
+
+# Map de colores consistente para las ventanas
+color_map = {
+    "3Y": "black",
+    "1Y": "#1f77b4",  # azul
+    "6M": "#2ca02c",  # verde
+    "3M": "#ff7f0e",  # naranja
+    "1M": "#d62728",  # rojo
+}
+
+# DataFrame binario: 1 si rentabilidad rolling >= su moda, 0 en caso contrario
+bin_df = pd.DataFrame(index=roll_ret_df.index)
+for col, mode_val in modes.items():
+    if np.isnan(mode_val):
+        bin_df[col] = np.nan
+    else:
+        bin_df[col] = (roll_ret_df[col] >= mode_val).astype(int)
+
+# Agregación mensual: proporción aprox. de días ≥ moda (normalizada dividiendo entre 21)
+# y limitada a 1 para no superar el 100%
+monthly_bin_all = (bin_df.resample('ME').sum().fillna(0) / 21).clip(upper=1.0)
+
+if not monthly_bin_all.empty:
+
+    month_labels = monthly_bin_all.index.strftime("%Y-%m")
+    desired_order = ["3Y", "1Y", "6M", "3M", "1M"]
+
+    # ----------------------------------------------------------------------
+    # 7.1) Todas las ventanas (3Y, 1Y, 6M, 3M, 1M)
+    # ----------------------------------------------------------------------
+    existing_all = [c for c in desired_order if c in monthly_bin_all.columns]
+    monthly_bin = monthly_bin_all[existing_all]
+    colors_all = [color_map[c] for c in existing_all]
+
+    fig_bars_all, ax_bars_all = plt.subplots(
+        figsize=(max(14, 0.3 * len(monthly_bin) + 10), 15)
+    )
+    monthly_bin.plot(
+        kind="bar",
+        stacked=True,
+        ax=ax_bars_all,
+        width=0.8,
+        color=colors_all,
+        legend=False
+    )
+
+    ax_bars_all.set_title(
+        "Frecuencia mensual de días con rentabilidad rolling ≥ moda (todas las ventanas)",
+        fontsize=24
+    )
+    ax_bars_all.set_xlabel("Mes", fontsize=20)
+    ax_bars_all.set_ylabel("Proporción aprox. de días (apilado por ventana)", fontsize=20)
+
+    # Límite Y solicitado (si prefieres 0–1, cambia a ax_bars_all.set_ylim(0, 1))
+    ax_bars_all.set_ylim(0, 5)
+
+    handles_all = [plt.Rectangle((0, 0), 1, 1, color=color_map[c]) for c in existing_all]
+    ax_bars_all.legend(
+        handles_all,
+        existing_all,
+        title="Ventana",
+        loc="upper left",
+        fontsize=30,
+        title_fontsize=24
+    )
+
+    ax_bars_all.set_xticklabels(month_labels, rotation=90, fontsize=20, ha="center")
+    ax_bars_all.tick_params(axis="y", labelsize=18)
+    plt.tight_layout()
+
+    # ----------------------------------------------------------------------
+    # 7.2) Solo 3Y y 1Y
+    # ----------------------------------------------------------------------
+    desired_long = ["3Y", "1Y"]
+    existing_long = [c for c in desired_long if c in monthly_bin_all.columns]
+
+    if existing_long:
+        monthly_bin_long = monthly_bin_all[existing_long]
+        colors_long = [color_map[c] for c in existing_long]
+
+        fig_bars_long, ax_bars_long = plt.subplots(
+            figsize=(max(14, 0.3 * len(monthly_bin_long) + 10), 10)
+        )
+        monthly_bin_long.plot(
+            kind="bar",
+            stacked=True,
+            ax=ax_bars_long,
+            width=0.8,
+            color=colors_long,
+            legend=False
+        )
+
+        ax_bars_long.set_title(
+            "Frecuencia mensual ≥ moda (3Y, 1Y)",
+            fontsize=24
+        )
+        ax_bars_long.set_xlabel("Mes", fontsize=20)
+        ax_bars_long.set_ylabel("Proporción aprox. de días", fontsize=20)
+
+        ax_bars_long.set_ylim(0, 2)
+
+        handles_long = [plt.Rectangle((0, 0), 1, 1, color=color_map[c]) for c in existing_long]
+        ax_bars_long.legend(
+            handles_long,
+            existing_long,
+            title="Ventana",
+            loc="upper left",
+            fontsize=26,
+            title_fontsize=22
+        )
+
+        ax_bars_long.set_xticklabels(month_labels, rotation=90, fontsize=18, ha="center")
+        ax_bars_long.tick_params(axis="y", labelsize=16)
+        plt.tight_layout()
+
+    # ----------------------------------------------------------------------
+    # 7.3) Solo 6M, 3M, 1M
+    # ----------------------------------------------------------------------
+    desired_short = ["6M", "3M", "1M"]
+    existing_short = [c for c in desired_short if c in monthly_bin_all.columns]
+
+    if existing_short:
+        monthly_bin_short = monthly_bin_all[existing_short]
+        colors_short = [color_map[c] for c in existing_short]
+
+        fig_bars_short, ax_bars_short = plt.subplots(
+            figsize=(max(14, 0.3 * len(monthly_bin_short) + 10), 10)
+        )
+        monthly_bin_short.plot(
+            kind="bar",
+            stacked=True,
+            ax=ax_bars_short,
+            width=0.8,
+            color=colors_short,
+            legend=False
+        )
+
+        ax_bars_short.set_title(
+            "Frecuencia mensual ≥ moda (6M, 3M, 1M)",
+            fontsize=24
+        )
+        ax_bars_short.set_xlabel("Mes", fontsize=20)
+        ax_bars_short.set_ylabel("Proporción aprox. de días", fontsize=20)
+
+        ax_bars_short.set_ylim(0, 3)
+
+        handles_short = [plt.Rectangle((0, 0), 1, 1, color=color_map[c]) for c in existing_short]
+        ax_bars_short.legend(
+            handles_short,
+            existing_short,
+            title="Ventana",
+            loc="upper left",
+            fontsize=26,
+            title_fontsize=22
+        )
+
+        ax_bars_short.set_xticklabels(month_labels, rotation=90, fontsize=18, ha="center")
+        ax_bars_short.tick_params(axis="y", labelsize=16)
+        plt.tight_layout()
+
+    # ----------------------------------------------------------------------
+    # 7.4) Barra horizontal – último mes (apilada, con etiquetas y leyenda fuera)
+    # ----------------------------------------------------------------------
+    last_period = monthly_bin_all.index.max()
+    last_label = last_period.strftime("%Y-%m")
+    metrics_last = [c for c in desired_order if c in monthly_bin_all.columns]
+    last_vals = monthly_bin_all.loc[last_period, metrics_last]
+
+    fig_bars_last, ax_bars_last = plt.subplots(figsize=(12, 4))
+
+    bars = []
+    left = 0
+    for m in metrics_last:
+        v = last_vals[m]
+        bar = ax_bars_last.barh(
+            y=0,
+            width=v,
+            left=left,
+            color=color_map[m],
+            label=m
+        )
+        bars.append((bar[0], m, v))
+        left += v
+
+    ax_bars_last.set_yticks([0])
+    ax_bars_last.set_yticklabels([last_label], fontsize=14)
+    ax_bars_last.set_xlabel("Proporción aprox. de días ≥ moda", fontsize=16)
+    ax_bars_last.set_title(
+        "Último mes: distribución por ventana (barra horizontal apilada)",
+        fontsize=18
+    )
+
+    # Etiquetas dentro de cada segmento (1 decimal)
+    for bar, m, v in bars:
+        x = bar.get_x() + bar.get_width() / 2.0
+        y = bar.get_y() + bar.get_height() / 2.0
+        if v > 0:
+            ax_bars_last.text(
+                x,
+                y,
+                f"{v:.1f}",
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="white",
+                fontweight="bold"
+            )
+
+    # Límite X solicitado (si prefieres 0–1, cambia a ax_bars_last.set_xlim(0, 1))
+    ax_bars_last.set_xlim(0, 5)
+
+    # Leyenda fuera del gráfico
+    handles_last = [plt.Rectangle((0, 0), 1, 1, color=color_map[m]) for m in metrics_last]
+    ax_bars_last.legend(
+        handles_last,
+        metrics_last,
+        title="Ventana",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        borderaxespad=0.,
+        fontsize=12,
+        title_fontsize=12
+    )
+
+    plt.tight_layout(rect=[0.0, 0.0, 0.8, 1.0])
+
+else:
+    print("monthly_bin_all está vacío: revisa que roll_ret_df tenga datos.")
+
+# =============================
+# 8) Histogramas – Rentabilidades diarias y Volatilidad diaria (misma fila)
+# =============================
+daily_ret = close.pct_change().dropna()
+last_daily = float(daily_ret.iloc[-1]) if len(daily_ret) else np.nan
+
+daily_vol = daily_ret.rolling(ROLLING_VOL_WINDOW).std().dropna()
+last_vol = float(daily_vol.iloc[-1]) if len(daily_vol) else np.nan
+
+fig6, (ax6a, ax6b) = plt.subplots(1, 2, figsize=(14, 4), sharex=False)
+# Histograma: rentabilidades diarias
+sns.histplot(daily_ret, bins='auto', kde=False, color='slateblue', ax=ax6a)
+if not np.isnan(last_daily):
+    ax6a.axvline(last_daily, color='red', linestyle='--', linewidth=1.5,
+                 label=f'Último = {last_daily:.2%}')
+ax6a.set_title('Distribución de rentabilidades diarias')
+ax6a.set_xlabel('Rentabilidad diaria')
+ax6a.set_ylabel('Frecuencia')
+ax6a.xaxis.set_major_formatter(PercentFormatter(1))
+ax6a.legend()
+
+# Histograma: volatilidad diaria
+sns.histplot(daily_vol, bins='auto', kde=False, color='darkcyan', ax=ax6b)
+if not np.isnan(last_vol):
+    ax6b.axvline(last_vol, color='red', linestyle='--', linewidth=1.5,
+                 label=f'Última vol ({ROLLING_VOL_WINDOW}d) = {last_vol:.2%}')
+ax6b.set_title(f"Distribución de volatilidad diaria (std. {ROLLING_VOL_WINDOW}d)")
+ax6b.set_xlabel('Volatilidad')
+ax6b.set_ylabel('Frecuencia')
+ax6b.xaxis.set_major_formatter(PercentFormatter(1))
+ax6b.legend()
+plt.tight_layout()
+
+# =============================
+# 9) Boxplot por día hábil (últimos 365 días) + puntos de la semana en curso
+# =============================
+last_date = close.index.max()
+window_start = last_date - pd.Timedelta(days=365)
+ret_last_year = daily_ret.loc[window_start: last_date].dropna().copy()
+
+if not ret_last_year.empty:
+    weekday_labels = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie']
+    grouped = [ret_last_year[ret_last_year.index.weekday == i].values for i in range(5)]
+
+    fig8, ax8 = plt.subplots(figsize=(10, 4))
+    bp = ax8.boxplot(
+        grouped,
+        positions=list(range(1, 6)),
+        labels=weekday_labels,
+        whis=[0, 100],
+        showfliers=False,
+        patch_artist=True,
+        boxprops=dict(facecolor='lightsteelblue')
+    )
+
+    week_start = last_date - pd.Timedelta(days=last_date.weekday())
+    this_week = daily_ret.loc[week_start: last_date]
+    for dt, val in this_week.items():
+        wd = dt.weekday()
+        if 0 <= wd <= 4:
+            x_pos = wd + 1
+            ax8.scatter(x_pos, val, color='red', s=40, zorder=3)
+
+    ax8.axhline(0, color='black', linewidth=0.8)
+    ax8.set_title('Boxplot de rentabilidades diarias por día de la semana (últimos 365 días)')
+    ax8.yaxis.set_major_formatter(PercentFormatter(1))
+    plt.tight_layout()
+
+# =============================
+# 10) Histograma – Drawdown
+# =============================
+fig9, ax9 = plt.subplots(figsize=(12, 4))
+sns.histplot(dd.dropna(), bins='auto', kde=False, color='indianred', ax=ax9)
+ax9.axvline(dd.iloc[-1], color='red', linestyle='--', linewidth=1.5,
+            label=f'Último = {dd.iloc[-1]:.2%}')
+_dd_mean = float(dd.mean()) if len(dd.dropna()) else np.nan
+if not np.isnan(_dd_mean):
+    ax9.axvline(_dd_mean, color='gray', linestyle='-', linewidth=1.2,
+                label=f'Media = {_dd_mean:.2%}')
+ax9.set_title('Distribución de drawdowns')
+ax9.set_xlabel('Drawdown')
+ax9.set_ylabel('Frecuencia')
+ax9.xaxis.set_major_formatter(PercentFormatter(1))
+ax9.legend()
+plt.tight_layout()
+
+# =============================
+# 11) Gráficos de rango intradía
+# =============================
+spx = ohlc.rename(columns={'Close': 'ClosePx'})
+spx['Range_abs'] = spx['High'] - spx['Low']
+spx['Range_pct'] = (spx['Range_abs'] / spx['Low']) * 100.0
+spx = spx.dropna(subset=['High', 'Low', 'ClosePx', 'Range_pct'])
+
+# Episodios donde el rango intradía supera el umbral
+spike_mask = spx['Range_pct'] > INTRADAY_RANGE_THRESHOLD
+spike_dates = spx.index[spike_mask]
+
+# Rentabilidad diaria (para colorear los puntos)
+daily_ret_intraday = close.pct_change()
+
+# Rentabilidad diaria en los días con spike de rango
+ret_on_spikes = daily_ret_intraday.reindex(spike_dates)
+
+# Máscara para colorear por signo
+neg_mask = ret_on_spikes < 0      # rentabilidad diaria < 0  → rojo
+pos_mask = ret_on_spikes > 0      # rentabilidad diaria > 0  → verde
+
+neg_dates = spike_dates[neg_mask.fillna(False)]
+pos_dates = spike_dates[pos_mask.fillna(False)]
+
+plt.style.use('seaborn-v0_8-whitegrid')
+fig10, (ax10a, ax10b) = plt.subplots(
+    2, 1, figsize=(12, 8), sharex=True,
+    gridspec_kw={'height_ratios': [2, 1]}
+)
+
+# Panel superior: precio de cierre + puntos coloreados por signo de la rentabilidad diaria
+ax10a.plot(spx.index, spx['ClosePx'], color='#1f77b4', label=f'{TICKER} (Close)')
+
+# Puntos con rango intradía > umbral y rentabilidad diaria < 0 (rojo)
+if len(neg_dates) > 0:
+    ax10a.scatter(
+        neg_dates,
+        spx.loc[neg_dates, 'ClosePx'],
+        color='red',
+        s=25,
+        label=f'Rango intradía > {INTRADAY_RANGE_THRESHOLD:g}% y rent. diaria < 0'
+    )
+
+# Puntos con rango intradía > umbral y rentabilidad diaria > 0 (verde)
+if len(pos_dates) > 0:
+    ax10a.scatter(
+        pos_dates,
+        spx.loc[pos_dates, 'ClosePx'],
+        color='green',
+        s=25,
+        label=f'Rango intradía > {INTRADAY_RANGE_THRESHOLD:g}% y rent. diaria > 0'
+    )
+
+ax10a.set_title(f"{TICKER} – Cierre con marcadores si rango intradía supera umbral")
+ax10a.set_ylabel('Nivel')
+ax10a.legend(loc='upper left')
+
+# Panel inferior: rango intradía (%)
+ax10b.plot(spx.index, spx['Range_pct'], color='#ff7f0e',
+           label='Rango intradía (%) = (High-Low)/Low*100')
+ax10b.axhline(
+    INTRADAY_RANGE_THRESHOLD,
+    color='red', linestyle='--', linewidth=1,
+    label=f'Umbral = {INTRADAY_RANGE_THRESHOLD:g}%'
+)
+ax10b.set_title('Rango intradía (%)')
+ax10b.set_ylabel('%')
+ax10b.legend(loc='upper left')
+
+locator = mdates.AutoDateLocator()
+formatter = mdates.ConciseDateFormatter(locator)
+ax10a.xaxis.set_major_locator(locator)
+ax10a.xaxis.set_major_formatter(formatter)
+plt.xlabel('Fecha')
+plt.tight_layout()
+
+# =============================
+# 12) Número de drawdowns > umbral por año
+# =============================
+counts = count_drawdown_events_by_year(close, DRAWDOWN_THRESHOLD)
+fig11, ax11 = plt.subplots(figsize=(12, 4))
+counts.plot(kind='bar', color='steelblue', ax=ax11)
+ax11.set_title(f'Número de drawdowns > {DRAWDOWN_THRESHOLD*100:.0f}% por año – {TICKER}')
+ax11.set_xlabel('Año')
+ax11.set_ylabel('Nº de drawdowns')
+mean_dd = counts.mean() if len(counts) else 0.0
+ax11.axhline(mean_dd, color='red', linestyle='--', linewidth=2,
+             label=f'Media = {mean_dd:.2f}')
+ax11.legend()
+plt.tight_layout()
+
+# =============================
+# 13) Scatter – Time Under Water vs. Drawdown
+# =============================
+rec_df, cens_df = compute_time_under_water_events(close, DRAWDOWN_THRESHOLD)
+fig12, ax12 = plt.subplots(figsize=(10, 5))
+
+if not rec_df.empty:
+    ax12.scatter(rec_df['tuw_days'], rec_df['min_dd'], c='steelblue',
+                 label='Recuperados', alpha=0.8)
+if not cens_df.empty:
+    ax12.scatter(cens_df['tuw_days'], cens_df['min_dd'], c='orange',
+                 label='En curso', alpha=0.8, marker='x')
+
+ax12.axhline(0.0, color='black', linewidth=0.8)
+ax12.set_title(f"Time Under Water vs. Drawdown (umbral {DRAWDOWN_THRESHOLD*100:.0f}%) – {TICKER}")
+ax12.set_xlabel('Time Under Water (días hábiles)')
+ax12.set_ylabel('Drawdown mínimo del episodio')
+ax12.yaxis.set_major_formatter(PercentFormatter(1))
+ax12.legend()
+plt.tight_layout()
+
+# =============================
+# 14) Barras agrupadas – Drawdown mínimo vs TUW
+# =============================
+events_all = []
+if 'rec_df' in locals() and not rec_df.empty:
+    tmp = rec_df.copy(); tmp['status'] = 'Recuperado'; events_all.append(tmp)
+if 'cens_df' in locals() and not cens_df.empty:
+    tmp = cens_df.copy(); tmp['status'] = 'En curso'; events_all.append(tmp)
+
+if events_all:
+    events_df = pd.concat(events_all, ignore_index=True)
+    events_df = events_df[events_df['min_dd'] <= -DRAWDOWN_THRESHOLD]
+    events_df = events_df.sort_values('min_date')
+
+    if not events_df.empty:
+        x = np.arange(len(events_df))
+        dates_str = events_df['min_date'].dt.strftime('%Y-%m-%d').tolist()
+        width = 0.42
+
+        fig14, ax14 = plt.subplots(figsize=(max(10, 0.6*len(events_df)+6), 5))
+        ax14.bar(x - width/2, events_df['min_dd'], width=width, color='steelblue',
+                 label='Drawdown mínimo')
+        ax14.set_ylabel('Drawdown (%)')
+        ax14.yaxis.set_major_formatter(PercentFormatter(1))
+
+        ax14b = ax14.twinx()
+        ax14b.bar(x + width/2, events_df['tuw_days'], width=width, color='orange',
+                  label='TUW (días)')
+        ax14b.set_ylabel('Time Under Water (días hábiles)')
+
+        ax14.grid(False)
+        ax14b.grid(False)
+
+        ax14.set_title(
+            f"Drawdown mínimo vs. Time Under Water (fecha = drawdown mínimo) – umbral {DRAWDOWN_THRESHOLD*100:.0f}%"
+        )
+        ax14.set_xticks(x)
+        ax14.set_xticklabels(dates_str, rotation=45, ha='right')
+
+        h1, l1 = ax14.get_legend_handles_labels()
+        h2, l2 = ax14b.get_legend_handles_labels()
+        ax14.legend(h1+h2, l1+l2, loc='upper left')
+        plt.tight_layout()
+
+# =============================
+# 15) Barras – TUW dividido por el drawdown (normalizado)
+# =============================
+_events_all = []
+if 'rec_df' in locals() and not rec_df.empty:
+    _tmp = rec_df.copy(); _tmp['status'] = 'Recuperado'; _events_all.append(_tmp)
+if 'cens_df' in locals() and not cens_df.empty:
+    _tmp = cens_df.copy(); _tmp['status'] = 'En curso'; _events_all.append(_tmp)
+
+if _events_all:
+    _events_df = pd.concat(_events_all, ignore_index=True)
+    _events_df = _events_df[_events_df['min_dd'] <= -DRAWDOWN_THRESHOLD]
+    _events_df = _events_df.sort_values('min_date')
+
+    if not _events_df.empty:
+        _events_df['tuw_per_pct'] = _events_df['tuw_days'] / (_events_df['min_dd'].abs() * 100.0)
+        _x = np.arange(len(_events_df))
+        _labels = _events_df['min_date'].dt.strftime('%Y-%m-%d').tolist()
+
+        fig15, ax15 = plt.subplots(figsize=(max(10, 0.6*len(_events_df)+6), 4.5))
+        ax15.bar(_x, _events_df['tuw_per_pct'], color='mediumpurple')
+        ax15.set_title(
+            f"TUW normalizado por drawdown (fecha = drawdown mínimo) – umbral {DRAWDOWN_THRESHOLD*100:.0f}%"
+        )
+        ax15.set_ylabel('Días bajo el agua por 1% de drawdown')
+        ax15.set_xticks(_x)
+        ax15.set_xticklabels(_labels, rotation=45, ha='right')
+
+        _mean_val = float(_events_df['tuw_per_pct'].mean()) if len(_events_df) else np.nan
+        if not np.isnan(_mean_val):
+            ax15.axhline(_mean_val, color='red', linestyle='--', linewidth=1.5,
+                         label=f"Media = {_mean_val:.2f} días/1%")
+            ax15.legend(loc='upper left')
+        plt.tight_layout()
